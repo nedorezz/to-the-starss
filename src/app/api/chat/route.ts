@@ -1,20 +1,13 @@
 import { NextRequest } from 'next/server';
 import ZAI from 'z-ai-web-dev-sdk';
-import { ensureAiConfig } from '@/lib/ai-config';
+import { ensureAiConfig, resolveAiModel } from '@/lib/ai-config';
+import { webSearch } from '@/lib/web-search';
 
 export const maxDuration = 120;
 
 interface IncomingMessage {
   role: 'user' | 'assistant';
   content: string;
-}
-
-interface SearchHit {
-  url?: string;
-  name?: string;
-  snippet?: string;
-  host_name?: string;
-  date?: string;
 }
 
 const SYSTEM_PROMPT = `Ты — ИИ приложения To the stars. Если спрашивают, кто ты, представляйся именно так: «ИИ приложения To the stars». Никогда не называй себя GLM, Z.ai или другой моделью. Твоя специализация: ближайшие хакатоны, розыгрыши призов, конкурсы, стажировки и способы усилить портфолио разработчика/студента.
@@ -69,12 +62,14 @@ export async function POST(req: NextRequest) {
     const zai = await ZAI.create();
     const today = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
     const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+    const aiModel = resolveAiModel();
 
     // Шаг 1: планирование поиска (нужен ли веб-поиск и какой запрос)
     let searchContext = '';
     if (lastUser) {
       try {
         const planRaw = await zai.chat.completions.create({
+          ...(aiModel ? { model: aiModel } : {}),
           messages: [{ role: 'user', content: planSearchPrompt(lastUser.content.slice(0, 500), today) }],
           thinking: { type: 'disabled' },
           temperature: 0,
@@ -83,11 +78,7 @@ export async function POST(req: NextRequest) {
           planRaw.choices[0]?.message?.content || '',
         );
         if (plan?.needSearch && plan.query?.trim()) {
-          const hits = (await zai.functions.invoke('web_search', {
-            query: plan.query.trim().slice(0, 200),
-            num: 6,
-            recency_days: 60,
-          })) as unknown as SearchHit[];
+          const hits = await webSearch(plan.query.trim().slice(0, 200), 6, 'oneMonth');
           const list = Array.isArray(hits) ? hits : [];
           if (list.length > 0) {
             const formatted = list
@@ -115,6 +106,7 @@ export async function POST(req: NextRequest) {
     ];
 
     const stream = await zai.chat.completions.create({
+      ...(aiModel ? { model: aiModel } : {}),
       messages: chatMessages,
       thinking: { type: 'disabled' },
       temperature: 0.6,

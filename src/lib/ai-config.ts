@@ -13,7 +13,22 @@ import path from 'path';
 
 const CONFIG_FILENAME = '.z-ai-config';
 
-type AiConfig = { baseUrl: string; apiKey: string };
+export type AiConfig = { baseUrl: string; apiKey: string };
+
+/** Модель по умолчанию для внешнего API z.ai (бесплатная GLM-4.5-Flash). */
+const DEFAULT_MODEL = 'glm-4.5-flash';
+
+/**
+ * Какую модель передавать в chat.completions.create.
+ * - AI_MODEL из env имеет приоритет (см. README);
+ * - на Vercel/внешнем API модель обязательна — подставляем бесплатную по умолчанию;
+ * - в песочнице платформа сама знает модель по умолчанию — не мешаем.
+ */
+export function resolveAiModel(): string | undefined {
+  if (process.env.AI_MODEL && process.env.AI_MODEL.trim()) return process.env.AI_MODEL.trim();
+  if (process.env.VERCEL) return DEFAULT_MODEL;
+  return undefined;
+}
 
 function readConfigFile(p: string): AiConfig | null {
   try {
@@ -55,6 +70,15 @@ function parseEnvConfig(): AiConfig | null {
     // невалидный JSON — считаем, что конфига нет
   }
   return null;
+}
+
+/** Возвращает конфиг ИИ (из файла или env), ничего не создавая. */
+export function getAiConfig(): AiConfig | null {
+  for (const p of candidatePaths()) {
+    const fromFile = readConfigFile(p);
+    if (fromFile) return fromFile;
+  }
+  return parseEnvConfig();
 }
 
 /**

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { domainToUnicode } from 'url';
 import ZAI from 'z-ai-web-dev-sdk';
-import { ensureAiConfig } from '@/lib/ai-config';
+import { ensureAiConfig, resolveAiModel } from '@/lib/ai-config';
+import { webSearch, type SearchHit, type Recency } from '@/lib/web-search';
 import type { Opportunity, Category } from '@/lib/types';
 
 export const maxDuration = 120;
@@ -32,14 +33,6 @@ const CATEGORY_QUERIES: Record<'hackathon' | 'giveaway' | 'portfolio', string[]>
     'открытые API пет-проекты идеи портфолио разработчика',
   ],
 };
-
-interface SearchHit {
-  url?: string;
-  name?: string;
-  snippet?: string;
-  host_name?: string;
-  date?: string;
-}
 
 function buildSystemPrompt(today: string): string {
   return `Ты — ИИ приложения To the stars, который помогает находить реальные возможности для айтишников и студентов: хакатоны, розыгрыши призов, конкурсы, стажировки и способы усилить портфолио.
@@ -135,16 +128,11 @@ export async function POST(req: NextRequest) {
       queries = ['актуальные айти события конкурсы хакатоны'];
     }
 
-    const recency = category === 'giveaway' ? 30 : 90;
+    const recency: Recency = category === 'giveaway' ? 'oneMonth' : 'oneYear';
 
     async function searchWithRetry(q: string, attempt = 1): Promise<SearchHit[]> {
       try {
-        const res = (await zai.functions.invoke('web_search', {
-          query: q,
-          num: 8,
-          recency_days: recency,
-        })) as unknown as SearchHit[];
-        return Array.isArray(res) ? res : [];
+        return await webSearch(q, 8, recency);
       } catch (e) {
         if (attempt < 2) {
           await new Promise((r) => setTimeout(r, 1500));
@@ -191,7 +179,9 @@ export async function POST(req: NextRequest) {
       })),
     );
 
+    const aiModel = resolveAiModel();
     const completion = await zai.chat.completions.create({
+      ...(aiModel ? { model: aiModel } : {}),
       messages: [
         { role: 'assistant', content: buildSystemPrompt(today) },
         { role: 'user', content: buildUserPrompt(category, customQuery, raw) },
