@@ -1,0 +1,24 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  sessionId String
+  title     String
+  category  String
+  url       String
+  source    String?
+  deadline  String?
+  prize     String?
+  format    String?
+  summary   String?
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+}
