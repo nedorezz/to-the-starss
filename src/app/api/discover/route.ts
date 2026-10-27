@@ -2,10 +2,15 @@ import { NextRequest, NextResponse } from 'next/server';
 import { domainToUnicode } from 'url';
 import ZAI from 'z-ai-web-dev-sdk';
 import { ensureAiConfig, resolveAiModel } from '@/lib/ai-config';
-import { webSearch, type SearchHit, type Recency } from '@/lib/web-search';
+import { webSearch, looksLikeHackathonQuery, type SearchHit, type Recency } from '@/lib/web-search';
 import type { Opportunity, Category } from '@/lib/types';
 
-export const maxDuration = 120;
+export const maxDuration = 60;
+
+/* Кэш готовых ответов на 15 минут: повторный тот же запрос — мгновенный, ИИ не дёргается */
+const RESP_TTL = 15 * 60 * 1000;
+const g = globalThis as unknown as { __ttsDiscoverCache?: Map<string, { at: number; payload: unknown }> };
+const respCache: Map<string, { at: number; payload: unknown }> = (g.__ttsDiscoverCache ??= new Map());
 
 function prettyHost(host: string): string {
   if (!host) return '';
@@ -61,7 +66,8 @@ function buildSystemPrompt(today: string): string {
 
 Правила:
 - Только ссылки, реально присутствующие в результатах поиска. Не выдумывай URL.
-- 4-8 самых качественных items. Если в выдаче мало конкретики — верни меньше.
+- 4-6 самых качественных items. Если в выдаче мало конкретики — верни меньше.
+- description — 1-2 ёмких предложения, без воды.
 - Пиши по-русски, кроме имён собственных и названий.
 - deadline указывай как в источнике (например «до 15 ноября 2026»).
 - category выбирай по смыслу: хакатон/соревнование по коду = hackathon, розыгрыш/раздача призов = giveaway, конкурс/стажировка/идея для пет-проекта = portfolio.`;
@@ -105,6 +111,13 @@ export async function POST(req: NextRequest) {
     const category: Category = (body.category || 'hackathon') as Category;
     const customQuery: string | undefined = body.query?.trim() || undefined;
 
+    // мгновенный ответ из кэша, если этот же запрос искали недавно
+    const respKey = `${category}|${customQuery || ''}`;
+    const cachedResp = respCache.get(respKey);
+    if (cachedResp && Date.now() - cachedResp.at < RESP_TTL) {
+      return NextResponse.json(cachedResp.payload as Record<string, unknown>);
+    }
+
     if (!ensureAiConfig()) {
       return NextResponse.json(
         {
@@ -118,7 +131,7 @@ export async function POST(req: NextRequest) {
     }
     const zai = await ZAI.create();
 
-    // 1. Последовательный веб-поиск с ретраем (чтобы не ловить rate-limit)
+    // 1. Веб-поиск: все запросы ПАРАЛЛЕЛЬНО (быстрее в 2-3 раза)
     let queries: string[];
     if (customQuery) {
       queries = [customQuery, `${customQuery} 2026 регистрация дедлайн`];
@@ -132,10 +145,11 @@ export async function POST(req: NextRequest) {
 
     async function searchWithRetry(q: string, attempt = 1): Promise<SearchHit[]> {
       try {
-        return await webSearch(q, 8, recency);
+        const hackathonMode = category === 'hackathon' || looksLikeHackathonQuery(q);
+        return await webSearch(q, 6, recency, { hackathon: hackathonMode });
       } catch (e) {
         if (attempt < 2) {
-          await new Promise((r) => setTimeout(r, 1500));
+          await new Promise((r) => setTimeout(r, 800));
           return searchWithRetry(q, attempt + 1);
         }
         console.error(`[discover] search failed for "${q}":`, e);
@@ -143,10 +157,8 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const searchResults: SearchHit[][] = [];
-    for (const q of queries) {
-      searchResults.push(await searchWithRetry(q));
-    }
+    // Promise.all вместо цикла: оба запроса летят одновременно
+    const searchResults: SearchHit[][] = await Promise.all(queries.map((q) => searchWithRetry(q)));
 
     const seen = new Set<string>();
     const hits: SearchHit[] = [];
@@ -172,7 +184,7 @@ export async function POST(req: NextRequest) {
     const raw = JSON.stringify(
       hits.map((h) => ({
         title: h.name,
-        snippet: h.snippet,
+        snippet: (h.snippet || '').slice(0, 220),
         url: h.url,
         host: h.host_name,
         date: h.date,
@@ -203,7 +215,7 @@ export async function POST(req: NextRequest) {
 
     const items: Opportunity[] = parsed.items
       .filter((it) => it && it.title && it.url)
-      .slice(0, 9)
+      .slice(0, 6)
       .map((it) => ({
         title: String(it.title).slice(0, 200),
         description: String(it.description || '').slice(0, 600),
@@ -218,11 +230,16 @@ export async function POST(req: NextRequest) {
           : category) as Category,
       }));
 
-    return NextResponse.json({
+    const successPayload = {
       items,
       summary: String(parsed.summary || ''),
       updatedAt: new Date().toISOString(),
-    });
+    };
+    if (items.length > 0) {
+      if (respCache.size > 100) respCache.clear();
+      respCache.set(respKey, { at: Date.now(), payload: successPayload });
+    }
+    return NextResponse.json(successPayload);
   } catch (error) {
     console.error('[discover] error:', error);
     return NextResponse.json(

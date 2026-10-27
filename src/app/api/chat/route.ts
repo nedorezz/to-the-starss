@@ -3,7 +3,7 @@ import ZAI from 'z-ai-web-dev-sdk';
 import { ensureAiConfig, resolveAiModel } from '@/lib/ai-config';
 import { webSearch } from '@/lib/web-search';
 
-export const maxDuration = 120;
+export const maxDuration = 60;
 
 interface IncomingMessage {
   role: 'user' | 'assistant';
@@ -20,28 +20,17 @@ const SYSTEM_PROMPT = `Ты — ИИ приложения To the stars. Если
 - Оформляй ответы markdown: заголовки ###, жирный **текст**, списки. Не пиши простыни текста — максимум ~250 слов, если не попросили подробнее.
 - В конце ответа, если уместно, предложи 1 короткий follow-up вопрос.`;
 
-function planSearchPrompt(userMessage: string, today: string): string {
-  return `Сегодня: ${today}. Сообщение пользователя: "${userMessage}"
+// Эвристика вместо LLM-планирования: экономит 1-3 секунды на каждом сообщении.
+// Ищем свежак только когда в сообщении есть «свежие» ключевые слова.
+const FRESH_HINT_RE =
+  /(хакатон|конкурс|олимпиад|челлендж|challenge|hackathon|розыгры|гив|giveaway|стажир|ваканси|дедлайн|срок|когда|приз|подар|раздач|найди|ищу|где|каки[ей]|актуальн|свеж|новост|ближайш|сейчас|сегодня|цена|купить|2025|2026|2027)/i;
+const GREETING_RE =
+  /^(привет|здравствуй|здорово|хай|хеллоу|hello|hi|ок(?:ей)?|спасибо|благодарю|пока|как дела|что ты умеешь|кто ты|кто тебя сделал|помощь|help)[\s!.,?]*$/i;
 
-Нужно ли искать актуальную информацию в интернете (дедлайны, актуальные события, призы, ссылки)?
-Если ДА — сформулируй ОДНУ оптимальную поисковую строку на русском или английском (что именно искать, чтобы найти свежие возможности для пользователя).
-Если НЕТ (общий вопрос, совет, объяснение) — верни пустую строку.
-
-Верни СТРОГО JSON без обёрток: {"needSearch": true|false, "query": "строка поиска или пустая"}`;
-}
-
-function extractJson<T>(text: string): T | null {
-  let cleaned = text.trim();
-  const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) cleaned = fence[1].trim();
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  try {
-    return JSON.parse(cleaned.slice(start, end + 1)) as T;
-  } catch {
-    return null;
-  }
+function needsFreshSearch(text: string): boolean {
+  const t = text.trim();
+  if (t.length < 9 || GREETING_RE.test(t)) return false;
+  return FRESH_HINT_RE.test(t);
 }
 
 export async function POST(req: NextRequest) {
@@ -64,32 +53,20 @@ export async function POST(req: NextRequest) {
     const lastUser = [...messages].reverse().find((m) => m.role === 'user');
     const aiModel = resolveAiModel();
 
-    // Шаг 1: планирование поиска (нужен ли веб-поиск и какой запрос)
+    // Шаг 1: нужен ли веб-поиск — решает мгновенная эвристика (без лишнего вызова ИИ)
     let searchContext = '';
-    if (lastUser) {
+    if (lastUser && needsFreshSearch(lastUser.content)) {
       try {
-        const planRaw = await zai.chat.completions.create({
-          ...(aiModel ? { model: aiModel } : {}),
-          messages: [{ role: 'user', content: planSearchPrompt(lastUser.content.slice(0, 500), today) }],
-          thinking: { type: 'disabled' },
-          temperature: 0,
-        });
-        const plan = extractJson<{ needSearch: boolean; query: string }>(
-          planRaw.choices[0]?.message?.content || '',
-        );
-        if (plan?.needSearch && plan.query?.trim()) {
-          const hits = await webSearch(plan.query.trim().slice(0, 200), 6, 'oneMonth');
-          const list = Array.isArray(hits) ? hits : [];
-          if (list.length > 0) {
-            const formatted = list
-              .filter((h) => h.url && h.name)
-              .map((h) => `- ${h.name} | ${h.url} | ${h.host_name || ''} | ${h.snippet || ''}`.slice(0, 400))
-              .join('\n');
-            searchContext = `\n\nРезультаты веб-поиска по запросу «${plan.query}»:\n${formatted}`;
-          }
+        const hits = await webSearch(lastUser.content.slice(0, 200), 6, 'oneMonth');
+        const list = (Array.isArray(hits) ? hits : []).filter((h) => h.url && h.name).slice(0, 6);
+        if (list.length > 0) {
+          const formatted = list
+            .map((h) => `- ${h.name} | ${h.url} | ${h.host_name || ''} | ${h.snippet || ''}`.slice(0, 400))
+            .join('\n');
+          searchContext = `\n\nРезультаты веб-поиска по запросу «${lastUser.content.slice(0, 120)}»:\n${formatted}`;
         }
       } catch (e) {
-        console.error('[chat] search planning failed:', e);
+        console.error('[chat] web search failed:', e);
       }
     }
 
