@@ -44,14 +44,14 @@ const DDG_DF: Partial<Record<Recency, string>> = {
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 
-const DDG_TIMEOUT = 6000;
+const DDG_TIMEOUT = 5000;
 
 /* ------------------------------------------------------------------ */
 /* Кэш в памяти процесса (переживает hot-reload через globalThis)      */
 /* ------------------------------------------------------------------ */
 
 type CacheEntry = { at: number; hits: SearchHit[] };
-const CACHE_TTL = 30 * 60 * 1000; // 30 минут для успешных результатов
+const CACHE_TTL = 60 * 60 * 1000; // 1 час для успешных результатов (категории не устают так быстро)
 const NEG_TTL = 60 * 1000; // 1 минута для пустых (не штормим поисковик)
 const CACHE_MAX = 300;
 
@@ -213,6 +213,66 @@ async function ddgSearch(query: string, num: number, recency: Recency): Promise<
   }
 
   return hits;
+}
+
+/* ------------------------------------------------------------------ */
+/* Бесплатные новостные RSS: Google News + Bing News                   */
+/* (русский контент, свежак, работают из датацентров без ключей)        */
+/* ------------------------------------------------------------------ */
+
+/** Фильтр свежести для Google News (оператор when: в запросе). */
+const GNEWS_WHEN: Partial<Record<Recency, string>> = {
+  oneDay: ' when:1d',
+  oneWeek: ' when:7d',
+  oneMonth: ' when:30d',
+  oneYear: ' when:1y',
+};
+
+function stripCdata(s: string): string {
+  return s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1');
+}
+
+/** Парсер RSS: <item> → SearchHit (общий для Google/Bing News). */
+function parseRssItems(xml: string, num: number): SearchHit[] {
+  const clean = stripCdata(xml);
+  const out: SearchHit[] = [];
+  for (const it of clean.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+    const b = it[1];
+    const title = stripTags(b.match(/<title>([\s\S]*?)<\/title>/)?.[1] || '');
+    const link = stripTags(b.match(/<link>([\s\S]*?)<\/link>/)?.[1] || '');
+    if (!title || !link || !/^https?:\/\//.test(link)) continue;
+    const source = stripTags(b.match(/<source[^>]*>([\s\S]*?)<\/source>/)?.[1] || '');
+    const date = stripTags(b.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1] || '');
+    const desc = stripTags(b.match(/<description>([\s\S]*?)<\/description>/)?.[1] || '');
+    out.push({ url: link, name: title, snippet: desc.slice(0, 300), host_name: source, date });
+    if (out.length >= num) break;
+  }
+  return out;
+}
+
+/** Google News RSS — бесплатно, без ключа, свежие новости со всего рунета. */
+async function gnewsSearch(query: string, num: number, recency: Recency): Promise<SearchHit[]> {
+  const when = GNEWS_WHEN[recency] || '';
+  const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query + when)}&hl=ru&gl=RU&ceid=RU:ru`;
+  const res = await fetch(url, {
+    headers: { 'User-Agent': UA, Accept: 'application/rss+xml,application/xml,text/xml' },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(7000),
+  });
+  if (!res.ok) throw new Error(`gnews ${res.status}`);
+  return parseRssItems(await res.text(), num);
+}
+
+/** Bing News RSS — запасной новостной источник. */
+async function bingNewsSearch(query: string, num: number): Promise<SearchHit[]> {
+  const url = `https://www.bing.com/news/search?q=${encodeURIComponent(query)}&format=RSS`;
+  const res = await fetch(url, {
+    headers: { 'User-Agent': UA, Accept: 'application/rss+xml,application/xml,text/xml' },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(7000),
+  });
+  if (!res.ok) throw new Error(`bingnews ${res.status}`);
+  return parseRssItems(await res.text(), num);
 }
 
 /* ------------------------------------------------------------------ */
@@ -439,15 +499,17 @@ export async function webSearch(
 
   const wantHackathon = opts.hackathon ?? looksLikeHackathonQuery(q);
 
-  // 2) бесплатная гонка источников
+  // 2) бесплатная гонка источников (порядок = приоритет при склейке)
   const jobs: Promise<SearchHit[]>[] = [];
   if (wantHackathon) jobs.push(devpostSearch(num));
+  jobs.push(gnewsSearch(q, num, recency));
+  jobs.push(bingNewsSearch(q, num));
   jobs.push(ddgSearch(q, num, recency));
   jobs.push(hnSearch(q, num));
 
   let hits: SearchHit[] = [];
   try {
-    hits = (await mergeSources(jobs, num)).slice(0, num);
+    hits = (await mergeSources(jobs, Math.min(4, num))).slice(0, num);
   } catch {
     hits = [];
   }

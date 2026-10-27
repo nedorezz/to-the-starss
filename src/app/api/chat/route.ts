@@ -82,13 +82,34 @@ export async function POST(req: NextRequest) {
       ),
     ];
 
-    const stream = await zai.chat.completions.create({
-      ...(aiModel ? { model: aiModel } : {}),
-      messages: chatMessages,
-      thinking: { type: 'disabled' },
-      temperature: 0.6,
-      stream: true,
-    });
+    // стрим с ретраем: api.z.ai иногда отдаёт 502/сбой соединения на первом запросе
+    let stream: unknown;
+    let lastLlmError: unknown = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        stream = await zai.chat.completions.create({
+          ...(aiModel ? { model: aiModel } : {}),
+          messages: chatMessages,
+          thinking: { type: 'disabled' },
+          temperature: 0.6,
+          stream: true,
+        });
+        break;
+      } catch (e) {
+        lastLlmError = e;
+        console.error(`[chat] llm attempt ${attempt} failed:`, (e as Error).message);
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+
+    // обе попытки упали ДО начала стрима — отвечаем понятным текстом вместо «ошибки соединения»
+    if (!stream) {
+      console.error('[chat] llm both attempts failed:', lastLlmError);
+      return new Response('ИИ-сервис перегружен. Попробуй отправить сообщение ещё раз через минуту.', {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache' },
+      });
+    }
 
     // SDK при stream:true возвращает сырой ReadableStream с SSE-строками `data: {...}`
     const encoder = new TextEncoder();

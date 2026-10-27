@@ -120,18 +120,26 @@ export default function Home() {
     [],
   );
 
+  // Автозагрузка ленты при открытии сайта: контент виден сразу,
+  // а повторные клики по категориям попадают в серверный кэш (мгновенно)
+  const bootstrapped = useRef(false);
+  useEffect(() => {
+    if (bootstrapped.current) return;
+    bootstrapped.current = true;
+    runDiscover('hackathon');
+  }, [runDiscover]);
+
   const handleSelectCategory = (c: Category) => {
-    if (loadingDiscover) return;
+    // без блокировки: повторный клик перекрывает прошлый запрос (requestSeq отбрасывает старый ответ)
     runDiscover(c);
   };
 
   const handleCustomSearch = (q: string) => {
-    if (loadingDiscover) return;
+    if (!q.trim()) return;
     runDiscover(null, q);
   };
 
   const handleRefresh = () => {
-    if (loadingDiscover) return;
     runDiscover(activeCategory, customQuery);
   };
 

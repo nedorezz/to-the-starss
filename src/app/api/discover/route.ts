@@ -7,8 +7,8 @@ import type { Opportunity, Category } from '@/lib/types';
 
 export const maxDuration = 60;
 
-/* Кэш готовых ответов на 15 минут: повторный тот же запрос — мгновенный, ИИ не дёргается */
-const RESP_TTL = 15 * 60 * 1000;
+/* Кэш готовых ответов на 60 минут: повторный тот же запрос — мгновенный, ИИ не дёргается */
+const RESP_TTL = 60 * 60 * 1000;
 const g = globalThis as unknown as { __ttsDiscoverCache?: Map<string, { at: number; payload: unknown }> };
 const respCache: Map<string, { at: number; payload: unknown }> = (g.__ttsDiscoverCache ??= new Map());
 
@@ -66,8 +66,8 @@ function buildSystemPrompt(today: string): string {
 
 Правила:
 - Только ссылки, реально присутствующие в результатах поиска. Не выдумывай URL.
-- 4-6 самых качественных items. Если в выдаче мало конкретики — верни меньше.
-- description — 1-2 ёмких предложения, без воды.
+- 3-5 самых качественных items. Если в выдаче мало конкретики — верни меньше.
+- description — одно ёмкое предложение, без воды.
 - Пиши по-русски, кроме имён собственных и названий.
 - deadline указывай как в источнике (например «до 15 ноября 2026»).
 - category выбирай по смыслу: хакатон/соревнование по коду = hackathon, розыгрыш/раздача призов = giveaway, конкурс/стажировка/идея для пет-проекта = portfolio.`;
@@ -98,10 +98,20 @@ function extractJson(text: string): { summary: string; items: Opportunity[] } | 
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
   if (start === -1 || end === -1 || end <= start) return null;
+  const body = cleaned.slice(start, end + 1);
   try {
-    return JSON.parse(cleaned.slice(start, end + 1));
+    return JSON.parse(body);
   } catch {
-    return null;
+    // JSON мог быть обрезан лимитом токенов — собираем из целых items
+    const lastBrace = body.lastIndexOf('}');
+    if (lastBrace <= 0) return null;
+    let assembled = body.slice(0, lastBrace + 1).replace(/,\s*$/, '');
+    if (/"items"\s*:\s*\[/.test(assembled) && !/\]\s*\}\s*$/.test(assembled)) assembled += ']}' ;
+    try {
+      return JSON.parse(assembled);
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -179,7 +189,9 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 2. ИИ структурирует результаты в карточки
+    const aiModel = resolveAiModel();
+
+    // 2. ИИ структурирует результаты в карточки (с ретраем — api.z.ai иногда моргает 502)
     const today = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
     const raw = JSON.stringify(
       hits.map((h) => ({
@@ -191,18 +203,29 @@ export async function POST(req: NextRequest) {
       })),
     );
 
-    const aiModel = resolveAiModel();
-    const completion = await zai.chat.completions.create({
-      ...(aiModel ? { model: aiModel } : {}),
-      messages: [
-        { role: 'assistant', content: buildSystemPrompt(today) },
-        { role: 'user', content: buildUserPrompt(category, customQuery, raw) },
-      ],
-      thinking: { type: 'disabled' },
-      temperature: 0.3,
-    });
+    const messages: { role: 'assistant' | 'user'; content: string }[] = [
+      { role: 'assistant', content: buildSystemPrompt(today) },
+      { role: 'user', content: buildUserPrompt(category, customQuery, raw) },
+    ];
 
-    const text = completion.choices[0]?.message?.content || '';
+    let text = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const completion = await zai.chat.completions.create({
+          ...(aiModel ? { model: aiModel } : {}),
+          messages,
+          thinking: { type: 'disabled' },
+          temperature: 0.3,
+          max_tokens: 2000,
+        });
+        text = completion.choices[0]?.message?.content || '';
+        if (extractJson(text)) break; // распарсилось — хватит
+      } catch (e) {
+        console.error(`[discover] llm attempt ${attempt} failed:`, (e as Error).message);
+      }
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 1200));
+    }
+
     const parsed = extractJson(text);
 
     if (!parsed || !Array.isArray(parsed.items)) {
@@ -242,9 +265,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(successPayload);
   } catch (error) {
     console.error('[discover] error:', error);
+    // мягкая деградация: 200 с понятным текстом вместо страшной ошибки соединения
     return NextResponse.json(
-      { items: [], summary: 'Ошибка поиска. Попробуйте ещё раз через минуту.', updatedAt: new Date().toISOString() },
-      { status: 500 },
+      {
+        items: [],
+        summary: 'ИИ-сервис перегружен. Попробуй ещё раз через минуту — обычно помогает.',
+        updatedAt: new Date().toISOString(),
+      },
+      { status: 200 },
     );
   }
 }
