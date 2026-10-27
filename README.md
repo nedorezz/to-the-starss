@@ -18,33 +18,8 @@
 
 Next.js 16 (App Router) · TypeScript · Tailwind CSS 4 · shadcn/ui · Framer Motion · Prisma + SQLite · z-ai-web-dev-sdk
 
-## Запуск локально
 
-```bash
-bun install        # или npm install
-bun run db:push    # создать SQLite-базу
-bun run dev        # http://localhost:3000
-```
+https://to-the-starss.vercel.app/
 
-> Без настроенного ИИ-ключа сайт откроется и будет работать — ИИ-лента и чат вежливо напишут, что ключ не подключён.
-
-## Деплой в интернет (GitHub + Vercel)
-
-1. Загрузи файлы проекта в репозиторий GitHub
-2. На vercel.com: «Add New…» → Project → Import репозитория → Deploy
-3. Готово: адрес вида `to-the-stars.vercel.app`
-
-## Переменные окружения
-
-| Переменная | Обязательна | Зачем |
-|---|---|---|
-| `DATABASE_URL` | да (уже в `.env.production`) | SQLite-база избранного (`file:/tmp/tts.db`) |
-| `ZAI_CONFIG_JSON` | для ИИ | Доступ к ИИ: `{"baseUrl":"https://api.z.ai/api/paas/v4","apiKey":"ТВОЙ_КЛЮЧ"}` |
-
-**Как включить ИИ на Vercel:** Settings → Environment Variables → добавь `ZAI_CONFIG_JSON` → Redeploy. Поиск и чат оживут.
-
-**Избранное** на бесплатном Vercel живёт до перезапуска сервера (SQLite в /tmp). Для постоянного хранения можно подключить бесплатную базу Turso или Neon.
-
----
 
 © 2026 To the stars · сделал dorezz ✦
