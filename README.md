@@ -20,4 +20,6 @@
 
 Next.js 16 (App Router) · TypeScript · Tailwind CSS 4 · shadcn/ui · Framer Motion · Prisma + SQLite · z-ai-web-dev-sdk
 
+https://to-the-starss.vercel.app/
+
 dorezz ✦
