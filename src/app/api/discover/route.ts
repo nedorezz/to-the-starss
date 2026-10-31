@@ -1,14 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { domainToUnicode } from 'url';
-import ZAI from 'z-ai-web-dev-sdk';
-import { ensureAiConfig, resolveAiModel } from '@/lib/ai-config';
-import { webSearch, looksLikeHackathonQuery, devpostSearch, type SearchHit, type Recency } from '@/lib/web-search';
+import { webSearch, looksLikeHackathonQuery, devpostSearch, type SearchHit } from '@/lib/web-search';
 import type { Opportunity, Category } from '@/lib/types';
 
-export const maxDuration = 60;
+export const maxDuration = 30;
 
-/* Кэш готовых ответов на 60 минут: повторный тот же запрос — мгновенный, ИИ не дёргается */
-const RESP_TTL = 60 * 60 * 1000;
+/*
+ * Подборка возможностей — БЫСТРАЯ и без ИИ-шага.
+ *
+ * Раньше здесь ИИ переписывал карточки, и каждый клик по категории занимал
+ * 20-40 секунд (выглядело как «кнопка не работает»). Теперь карточки
+ * собираются напрямую из бесплатных источников (Devpost, Google News,
+ * Bing News, DuckDuckGo, Hacker News) за 3-8 секунд, а повторные клики
+ * отвечаются мгновенно из кэша. Живой ИИ остался в чате (/api/chat).
+ */
+
+/* Кэш готовых ответов: повторный тот же запрос — мгновенный */
+const RESP_TTL = 30 * 60 * 1000;
 const g = globalThis as unknown as { __ttsDiscoverCache?: Map<string, { at: number; payload: unknown }> };
 const respCache: Map<string, { at: number; payload: unknown }> = (g.__ttsDiscoverCache ??= new Map());
 
@@ -23,126 +31,137 @@ function prettyHost(host: string): string {
 
 const CATEGORY_QUERIES: Record<'hackathon' | 'giveaway' | 'portfolio', string[]> = {
   hackathon: [
-    'ближайшие хакатоны 2026 регистрация открыта',
-    'хакатоны онлайн для разработчиков список',
-    'hackathon 2026 upcoming registration',
+    'ближайшие хакатоны регистрация открыта',
+    'хакатон 2026 онлайн для разработчиков',
+    'upcoming hackathon registration open',
   ],
   giveaway: [
     'розыгрыш призов для айтишников разработчиков',
-    'конкурс с призами техника гаджеты раздача',
-    'giveaway tech prizes developers 2026',
+    'конкурс с призами техника гаджеты',
+    'giveaway tech prizes developers',
   ],
   portfolio: [
     'конкурсы для разработчиков укрепить портфолио',
-    'стажировки и олимпиады для программистов портфолио',
-    'открытые API пет-проекты идеи портфолио разработчика',
+    'стажировки для программистов подача открыта',
+    'студенческие олимпиады и конкурсы программирование',
   ],
 };
 
-function buildSystemPrompt(today: string): string {
-  return `Ты — ИИ приложения To the stars, который помогает находить реальные возможности для айтишников и студентов: хакатоны, розыгрыши призов, конкурсы, стажировки и способы усилить портфолио.
+/** Ключевые слова релевантности: отсеиваем новости, не про тему категории. */
+const CATEGORY_FILTER: Record<'hackathon' | 'giveaway' | 'portfolio', RegExp> = {
+  hackathon: /(хакатон|hackathon|гейм\s?джем|game\s?jam|джем|ctf|соревнован|чемпионат|олимпиад)/i,
+  giveaway: /(розыгрыш|разыгрыва|giveaway|раздач|приз|подарк|конкурс)/i,
+  portfolio: /(конкурс|стажировк|олимпиад|портфолио|стипенди|интенсив|хакатон|hackathon|проект|программ|internship|intern)/i,
+};
 
-Сегодняшняя дата: ${today}.
-
-Тебе даны сырые результаты веб-поиска. Извлеки из них ВСЕ конкретные возможности (мероприятия, конкурсы, розыгрыши, программы), которые реально полезны. Отфильтруй нерелевантное и устаревшее.
-
-Верни СТРОГО валидный JSON без markdown-обёрток в формате:
-{
-  "summary": "1-2 предложения на русском: что нашлось и на что обратить внимание",
-  "items": [
-    {
-      "title": "название возможности",
-      "description": "2-3 предложения на русском: суть, кто может участвовать, почему стоит",
-      "url": "точная ссылка из результатов поиска",
-      "source": "домен сайта",
-      "deadline": "дедлайн/даты проведения или 'Уточнить на сайте'",
-      "prize": "призовой фонд/призы или пустая строка",
-      "format": "онлайн / оффлайн+город / гибрид",
-      "level": "для новичков / для опытных / для всех",
-      "category": "hackathon | giveaway | portfolio | other"
-    }
-  ]
+function pluralRu(n: number, one: string, few: string, many: string): string {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return few;
+  return many;
 }
 
-Правила:
-- Только ссылки, реально присутствующие в результатах поиска. Не выдумывай URL.
-- 3-5 самых качественных items. Если в выдаче мало конкретики — верни меньше.
-- description — одно ёмкое предложение, без воды.
-- Пиши по-русски, кроме имён собственных и названий.
-- deadline указывай как в источнике (например «до 15 ноября 2026»).
-- category выбирай по смыслу: хакатон/соревнование по коду = hackathon, розыгрыш/раздача призов = giveaway, конкурс/стажировка/идея для пет-проекта = portfolio.`;
+function summaryFor(category: Category, count: number, custom: boolean): string {
+  const v = pluralRu(count, 'вариант', 'варианта', 'вариантов');
+  if (custom) {
+    return `Нашёл ${count} ${v} по твоему запросу — даты и условия смотри на карточках и сайтах организаторов.`;
+  }
+  if (category === 'hackathon') {
+    return `Собрал ${count} актуальных ${pluralRu(count, 'хакатон', 'хакатона', 'хакатонов')} с открытой регистрацией — сроки, направления и призовой фонд прямо на карточках. Успей подать заявку!`;
+  }
+  if (category === 'giveaway') {
+    return `Свежие розыгрыши и конкурсы с призами для айтишников — ${count} ${v}. Проверяй условия на страницах организаторов и удачи!`;
+  }
+  if (category === 'portfolio') {
+    return `Конкурсы, стажировки и поводы прокачать портфолио — ${count} ${v}. Выбирай, что ближе, и подавайся.`;
+  }
+  return `Вот что нашлось: ${count} ${v}. Даты и условия уточняй на сайтах организаторов.`;
 }
 
-function buildUserPrompt(category: Category, customQuery: string | undefined, raw: string): string {
-  const catName =
-    category === 'hackathon'
-      ? 'хакатоны и соревнования по программированию'
-      : category === 'giveaway'
-        ? 'розыгрыши и раздачи призов для айтишников'
-        : category === 'portfolio'
-          ? 'конкурсы, стажировки и проекты для усиления портфолио разработчика'
-          : 'возможности по запросу пользователя';
-  return `Категория поиска: ${catName}
-Пользовательский запрос: ${customQuery || 'стандартный подбор по категории'}
-
-Результаты веб-поиска (JSON):
-${raw}
-
-Извлеки возможности и верни строго JSON по формату из инструкции.`;
+/** Карточка из сырого результата поиска (без ИИ): заголовок + сниппет. */
+function hitToOpportunity(h: SearchHit, category: Category): Opportunity {
+  const snippet = (h.snippet || '').replace(/\s+/g, ' ').trim();
+  return {
+    title: (h.name || 'Без названия').slice(0, 200),
+    description: (snippet || 'Подробности, условия участия и дедлайны — на странице организатора.').slice(0, 600),
+    url: h.url || '',
+    source: prettyHost(h.host_name || ''),
+    category,
+  };
 }
 
-function extractJson(text: string): { summary: string; items: Opportunity[] } | null {
-  let cleaned = text.trim();
-  const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) cleaned = fence[1].trim();
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  const body = cleaned.slice(start, end + 1);
-  try {
-    return JSON.parse(body);
-  } catch {
-    // JSON мог быть обрезан лимитом токенов — собираем из целых items
-    const lastBrace = body.lastIndexOf('}');
-    if (lastBrace <= 0) return null;
-    let assembled = body.slice(0, lastBrace + 1).replace(/,\s*$/, '');
-    if (/"items"\s*:\s*\[/.test(assembled) && !/\]\s*\}\s*$/.test(assembled)) assembled += ']}' ;
-    try {
-      return JSON.parse(assembled);
-    } catch {
-      return null;
+function dedupeHits(lists: SearchHit[][]): SearchHit[] {
+  const seen = new Set<string>();
+  const out: SearchHit[] = [];
+  for (const list of lists) {
+    for (const hit of Array.isArray(list) ? list : []) {
+      const url = (hit.url || '').replace(/\/$/, '');
+      if (!url || !hit.name || seen.has(url)) continue;
+      seen.add(url);
+      out.push(hit);
     }
   }
+  return out;
 }
 
-function devpostToOpportunity(h: SearchHit): Opportunity {
-  const m = h.meta || {};
-  const bits: string[] = [];
-  if (m.dates) bits.push(`Проведение: ${m.dates}`);
-  if (m.prize) bits.push(`призовой фонд ${m.prize}`);
-  if (m.themes) bits.push(`направления: ${m.themes}`);
-  if (m.members) bits.push(`уже участвуют: ${m.members}`);
-  const where = m.location && m.location.toLowerCase() !== 'online' ? ` (${m.location})` : '';
-  const desc =
-    bits.length > 0
-      ? `Регистрация открыта${where}. ${bits.join(', ')}.`
-      : 'Регистрация открыта — детали, требования и состав команды на странице хакатона.';
-  return {
-    title: h.name || 'Хакатон на Devpost',
-    description: desc,
-    url: h.url || 'https://devpost.com/hackathons',
-    source: 'devpost.com',
-    deadline: m.dates || 'Уточнить на сайте',
-    prize: m.prize || '',
-    format: where ? 'оффлайн+город' : 'онлайн',
-    level: 'для всех',
-    category: 'hackathon',
-  };
+function buildItems(hits: SearchHit[], category: Category, structuredFirst = true): Opportunity[] {
+  // 1) Структурные карточки Devpost (даты, призовой фонд, темы) — наверх
+  const structured: Opportunity[] = [];
+  const plain: SearchHit[] = [];
+  for (const h of hits) {
+    if (h.meta && h.url) {
+      const m = h.meta;
+      const bits: string[] = [];
+      if (m.dates) bits.push(`Проведение: ${m.dates}`);
+      if (m.prize) bits.push(`призовой фонд ${m.prize}`);
+      if (m.themes) bits.push(`направления: ${m.themes}`);
+      if (m.members) bits.push(`уже участвуют: ${m.members}`);
+      const where = m.location && m.location.toLowerCase() !== 'online' ? ` (${m.location})` : '';
+      structured.push({
+        title: (h.name || 'Хакатон на Devpost').slice(0, 200),
+        description:
+          bits.length > 0
+            ? `Регистрация открыта${where}. ${bits.join(', ')}.`
+            : 'Регистрация открыта — детали, требования и состав команды на странице хакатона.',
+        url: h.url,
+        source: 'devpost.com',
+        deadline: m.dates || 'Уточнить на сайте',
+        prize: m.prize || '',
+        format: where ? 'оффлайн+город' : 'онлайн',
+        level: 'для всех',
+        category: 'hackathon',
+      });
+    } else {
+      plain.push(h);
+    }
+  }
+
+  // 2) Остальное — фильтруем по ключевым словам категории
+  const filter = CATEGORY_FILTER[category as 'hackathon' | 'giveaway' | 'portfolio'];
+  let filtered = filter
+    ? plain.filter((h) => filter.test(`${h.name || ''} ${h.snippet || ''}`))
+    : plain;
+  if (filtered.length < 2 && plain.length > 0) {
+    // слишком строгий фильтр — показываем хотя бы первые попавшиеся
+    filtered = plain;
+  }
+
+  const mapped = filtered.map((h) => hitToOpportunity(h, category)).filter((it) => it.url);
+  const seen = new Set<string>();
+  const ordered = structuredFirst ? [...structured, ...mapped] : [...mapped, ...structured];
+  return ordered
+    .filter((it) => {
+      if (!it.url || seen.has(it.url)) return false;
+      seen.add(it.url);
+      return true;
+    })
+    .slice(0, 6);
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
+    const body = await req.json().catch(() => ({}));
     const category: Category = (body.category || 'hackathon') as Category;
     const customQuery: string | undefined = body.query?.trim() || undefined;
 
@@ -153,186 +172,52 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(cachedResp.payload as Record<string, unknown>);
     }
 
-    // Быстрый путь для категории «Хакатоны»: Devpost сам отдаёт готовую структуру
-    // (даты, призовой фонд, темы), ИИ не нужен — ответ за 1-3 секунды и без
-    // зависимости от api.z.ai (который иногда отдаёт 502 или думает 15-25 секунд).
-    if (!customQuery && category === 'hackathon') {
-      try {
-        const devHits = await devpostSearch(6);
-        if (devHits.length >= 3) {
-          const fastItems = devHits.slice(0, 6).map(devpostToOpportunity);
-          const fastPayload = {
-            items: fastItems,
-            summary: `Нашёл ${fastItems.length} актуальных хакатонов с открытой регистрацией на Devpost — даты, направления и призовой фонд на карточках. Успей подать заявку!`,
-            updatedAt: new Date().toISOString(),
-          };
-          if (respCache.size > 100) respCache.clear();
-          respCache.set(respKey, { at: Date.now(), payload: fastPayload });
-          return NextResponse.json(fastPayload);
-        }
-      } catch (e) {
-        console.error('[discover] devpost fast path failed:', (e as Error).message);
-        // молча падаем в обычный путь ниже
-      }
-    }
+    // Запросы категории летят ПАРАЛЛЕЛЬНО, общий потолок ~6-8 секунд на источники.
+    const queries: string[] = customQuery
+      ? [customQuery, `${customQuery} регистрация дедлайн`]
+      : (CATEGORY_QUERIES[category] || CATEGORY_QUERIES.hackathon).slice(0, 2);
 
-    if (!ensureAiConfig()) {
-      return NextResponse.json(
-        {
-          items: [],
-          summary:
-            'ИИ-поиск не подключён: на сервере нет API-ключа z-ai. Добавь переменную ZAI_CONFIG_JSON в настройках хостинга (см. README), и поиск оживёт.',
-          updatedAt: new Date().toISOString(),
-        },
-        { status: 200 },
-      );
-    }
-    const zai = await ZAI.create();
+    const recency = category === 'giveaway' ? 'oneMonth' : 'oneYear';
+    const wantHackathon = category === 'hackathon' || looksLikeHackathonQuery(customQuery || '');
 
-    // 1. Веб-поиск: все запросы ПАРАЛЛЕЛЬНО (быстрее в 2-3 раза)
-    let queries: string[];
-    if (customQuery) {
-      queries = [customQuery, `${customQuery} 2026 регистрация дедлайн`];
-    } else if (category === 'hackathon' || category === 'giveaway' || category === 'portfolio') {
-      queries = CATEGORY_QUERIES[category].slice(0, 2);
-    } else {
-      queries = ['актуальные айти события конкурсы хакатоны'];
-    }
-
-    const recency: Recency = category === 'giveaway' ? 'oneMonth' : 'oneYear';
-
-    async function searchWithRetry(q: string, attempt = 1): Promise<SearchHit[]> {
-      try {
-        const hackathonMode = category === 'hackathon' || looksLikeHackathonQuery(q);
-        return await webSearch(q, 6, recency, { hackathon: hackathonMode });
-      } catch (e) {
-        if (attempt < 2) {
-          await new Promise((r) => setTimeout(r, 800));
-          return searchWithRetry(q, attempt + 1);
-        }
-        console.error(`[discover] search failed for "${q}":`, e);
-        return [];
-      }
-    }
-
-    // Promise.all вместо цикла: оба запроса летят одновременно
-    const searchResults: SearchHit[][] = await Promise.all(queries.map((q) => searchWithRetry(q)));
-
-    const seen = new Set<string>();
-    const hits: SearchHit[] = [];
-    for (const list of searchResults) {
-      for (const hit of Array.isArray(list) ? (list as SearchHit[]) : []) {
-        const url = hit.url || '';
-        if (!url || !hit.name || seen.has(url)) continue;
-        seen.add(url);
-        hits.push(hit);
-      }
-    }
-
-    // Для хакатон-запросов подмешиваем структурные данные Devpost — ИИ получает качественный материал
-    if (category === 'hackathon' || looksLikeHackathonQuery(customQuery || '')) {
-      try {
-        const devHits = await devpostSearch(4);
-        for (const h of devHits) {
-          const url = h.url || '';
-          if (!url || !h.name || seen.has(url)) continue;
-          seen.add(url);
-          hits.push(h);
-        }
-      } catch {
-        // не критично — работают остальные источники
-      }
-    }
-
-    if (hits.length === 0) {
-      return NextResponse.json({
-        items: [],
-        summary: 'Поиск не дал результатов. Попробуйте изменить запрос позже.',
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
-    const aiModel = resolveAiModel();
-
-    // 2. ИИ структурирует результаты в карточки (с ретраем — api.z.ai иногда моргает 502)
-    const today = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
-    const raw = JSON.stringify(
-      hits.map((h) => ({
-        title: h.name,
-        snippet: (h.snippet || '').slice(0, 220),
-        url: h.url,
-        host: h.host_name,
-        date: h.date,
-      })),
+    const jobs: Promise<SearchHit[]>[] = queries.map((q) =>
+      // для кастомного запроса порог выше, чем отдаёт один источник (6),
+      // чтобы тематические новости успели поучаствовать в выдаче
+      webSearch(q, 6, recency, { hackathon: wantHackathon, minEnough: customQuery ? 8 : 4 }),
     );
+    // Для хакатонов добавляем Devpost отдельной гонкой — его структурные карточки (даты/призы) лучше всех
+    if (wantHackathon) jobs.push(devpostSearch(6).catch(() => []));
 
-    const messages: { role: 'assistant' | 'user'; content: string }[] = [
-      { role: 'assistant', content: buildSystemPrompt(today) },
-      { role: 'user', content: buildUserPrompt(category, customQuery, raw) },
-    ];
+    const searchResults = await Promise.all(jobs.map((p) => p.catch(() => [] as SearchHit[])));
+    const hits = dedupeHits(searchResults);
+    // при кастомном запросе сначала тематические результаты, потом общий список Devpost
+    const items = buildItems(hits, category, !customQuery);
 
-    let text = '';
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const completion = await zai.chat.completions.create({
-          ...(aiModel ? { model: aiModel } : {}),
-          messages,
-          thinking: { type: 'disabled' },
-          temperature: 0.3,
-          max_tokens: 2000,
-        });
-        text = completion.choices[0]?.message?.content || '';
-        if (extractJson(text)) break; // распарсилось — хватит
-      } catch (e) {
-        console.error(`[discover] llm attempt ${attempt} failed:`, (e as Error).message);
-      }
-      if (attempt < 2) await new Promise((r) => setTimeout(r, 1200));
-    }
-
-    const parsed = extractJson(text);
-
-    if (!parsed || !Array.isArray(parsed.items)) {
-      return NextResponse.json({
+    if (items.length === 0) {
+      const emptyPayload = {
         items: [],
-        summary: 'Не удалось структурировать результаты. Попробуйте ещё раз.',
+        summary: 'Сейчас ничего не нашлось — источники могли подтормозить. Нажми «Обновить» или попробуй ещё раз через минуту.',
         updatedAt: new Date().toISOString(),
-      });
+      };
+      respCache.set(respKey, { at: Date.now(), payload: emptyPayload });
+      return NextResponse.json(emptyPayload);
     }
 
-    const items: Opportunity[] = parsed.items
-      .filter((it) => it && it.title && it.url)
-      .slice(0, 6)
-      .map((it) => ({
-        title: String(it.title).slice(0, 200),
-        description: String(it.description || '').slice(0, 600),
-        url: String(it.url),
-        source: prettyHost(String(it.source || '')),
-        deadline: it.deadline ? String(it.deadline).slice(0, 80) : undefined,
-        prize: it.prize ? String(it.prize).slice(0, 120) : undefined,
-        format: it.format ? String(it.format).slice(0, 60) : undefined,
-        level: it.level ? String(it.level).slice(0, 40) : undefined,
-        category: (['hackathon', 'giveaway', 'portfolio', 'other'].includes(it.category)
-          ? it.category
-          : category) as Category,
-      }));
-
-    const successPayload = {
+    const payload = {
       items,
-      summary: String(parsed.summary || ''),
+      summary: summaryFor(category, items.length, Boolean(customQuery)),
       updatedAt: new Date().toISOString(),
     };
-    if (items.length > 0) {
-      if (respCache.size > 100) respCache.clear();
-      respCache.set(respKey, { at: Date.now(), payload: successPayload });
-    }
-    return NextResponse.json(successPayload);
+    if (respCache.size > 100) respCache.clear();
+    respCache.set(respKey, { at: Date.now(), payload });
+    return NextResponse.json(payload);
   } catch (error) {
     console.error('[discover] error:', error);
     // мягкая деградация: 200 с понятным текстом вместо страшной ошибки соединения
     return NextResponse.json(
       {
         items: [],
-        summary: 'ИИ-сервис перегружен. Попробуй ещё раз через минуту — обычно помогает.',
+        summary: 'Поиск подтормозил. Нажми «Обновить» — обычно второй заход отвечает мгновенно.',
         updatedAt: new Date().toISOString(),
       },
       { status: 200 },

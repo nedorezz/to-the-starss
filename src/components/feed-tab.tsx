@@ -17,7 +17,7 @@ import {
 } from '@/components/ui/dialog';
 import { OpportunityCard } from '@/components/opportunity-card';
 import { useToast } from '@/hooks/use-toast';
-import type { Category, DiscoverResponse, Opportunity } from '@/lib/types';
+import type { Category, DiscoverResponse, Opportunity, DreamStarInfo } from '@/lib/types';
 
 export const DREAM_COLORS = [
   {
@@ -117,22 +117,45 @@ export function FeedTab({
     const text = dreamText.trim();
     if (!text || dreamSaving) return;
     setDreamSaving(true);
+    // ошибка-лимит/ввода — показываем пользователю; сетевой сбой — зажигаем звезду локально
+    class DreamLimitError extends Error {}
     try {
       let sid = localStorage.getItem('tts_session');
       if (!sid) {
         sid = uuidv4();
         localStorage.setItem('tts_session', sid);
       }
-      const res = await fetch('/api/dreams', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, color: dreamColor, sessionId: sid }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.dream) {
-        throw new Error(json.error || 'Не удалось зажечь звезду');
+      let dream: DreamStarInfo | null = null;
+      try {
+        const res = await fetch('/api/dreams', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, color: dreamColor, sessionId: sid }),
+        });
+        if (res.ok) {
+          const json = await res.json();
+          dream = json.dream || null;
+        } else if (res.status === 429 || res.status === 400) {
+          const json = await res.json().catch(() => ({}));
+          throw new DreamLimitError(json.error || 'Не удалось зажечь звезду');
+        }
+        // остальные коды (500/сеть) — зажжём звезду локально, см. ниже
+      } catch (e) {
+        if (e instanceof DreamLimitError) throw e;
       }
-      window.dispatchEvent(new CustomEvent('tts:dream-added', { detail: json.dream }));
+
+      if (!dream) {
+        // сервер не ответил — всё равно зажигаем звезду: она будет видна в этом браузере
+        dream = {
+          id: `local-${uuidv4()}`,
+          text,
+          color: dreamColor,
+          x: Math.round((3 + Math.random() * 92) * 10) / 10,
+          y: Math.round((9 + Math.random() * 62) * 10) / 10,
+          createdAt: new Date().toISOString(),
+        };
+      }
+      window.dispatchEvent(new CustomEvent('tts:dream-added', { detail: dream }));
       toast({ title: 'Твоя звезда зажглась на небе ✦' });
       setDreamOpen(false);
       setDreamText('');

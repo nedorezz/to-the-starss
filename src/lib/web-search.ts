@@ -307,15 +307,38 @@ interface DevpostItem {
   organization_name?: string;
 }
 
+/* Кэш Devpost в памяти процесса: успех живёт 10 минут, а «недоступен» — 2 минуты,
+   чтобы с Vercel (где Devpost иногда блокирует датацентровые IP) не ждать зря по 4-7 секунд
+   при каждом обращении. */
+const gDevpost = globalThis as unknown as { __ttsDevpostCache?: { at: number; hits: SearchHit[] } };
+
 /** Devpost — публичный API актуальных хакатонов (бесплатно, без ключа). */
 export async function devpostSearch(num: number): Promise<SearchHit[]> {
-  const res = await fetch(`https://devpost.com/api/hackathons?status=upcoming&limit=${Math.max(10, num)}`, {
-    headers: { 'User-Agent': UA, Accept: 'application/json' },
-    cache: 'no-store',
-    signal: AbortSignal.timeout(7000),
-  });
-  if (!res.ok) throw new Error(`devpost ${res.status}`);
-  const data = (await res.json()) as { hackathons?: DevpostItem[] };
+  const memo = (gDevpost.__ttsDevpostCache ??= { at: 0, hits: [] });
+  if (memo.hits.length > 0 && Date.now() - memo.at < 10 * 60 * 1000) return memo.hits.slice(0, num);
+  // недавно был сбой — не тормозим ответ, сразу считаем источники без Devpost
+  if (memo.hits.length === 0 && memo.at > 0 && Date.now() - memo.at < 2 * 60 * 1000) return [];
+
+  let res: Response;
+  try {
+    res = await fetch(`https://devpost.com/api/hackathons?status=upcoming&limit=${Math.max(10, num)}`, {
+      headers: { 'User-Agent': UA, Accept: 'application/json' },
+      cache: 'no-store',
+      signal: AbortSignal.timeout(4500),
+    });
+    if (!res.ok) throw new Error(`devpost ${res.status}`);
+  } catch (e) {
+    // фиксируем сбой (в т.ч. таймаут), чтобы следующие 2 минуты не ждать Devpost
+    memo.at = Date.now();
+    memo.hits = [];
+    throw e;
+  }
+  const data = (await res.json().catch(() => null)) as { hackathons?: DevpostItem[] } | null;
+  if (!data) {
+    memo.at = Date.now();
+    memo.hits = [];
+    throw new Error('devpost: bad json');
+  }
   const out: SearchHit[] = [];
   for (const h of data.hackathons || []) {
     if (!h.title || !h.url) continue;
@@ -345,7 +368,9 @@ export async function devpostSearch(num: number): Promise<SearchHit[]> {
     });
     if (out.length >= num) break;
   }
-  return out;
+  memo.at = Date.now();
+  memo.hits = out;
+  return out.slice(0, num);
 }
 
 interface HnHit {
@@ -388,7 +413,7 @@ async function hnSearch(query: string, num: number): Promise<SearchHit[]> {
 }
 
 /** Дождаться бесплатные источники; не ждём медленные, если уже хватит результатов. */
-function mergeSources(jobs: Promise<SearchHit[]>[], minEnough: number, hardDeadlineMs = 7500): Promise<SearchHit[]> {
+function mergeSources(jobs: Promise<SearchHit[]>[], minEnough: number, hardDeadlineMs = 6500): Promise<SearchHit[]> {
   return new Promise((resolve) => {
     const results: SearchHit[][] = jobs.map(() => []);
     let done = 0;
@@ -508,7 +533,7 @@ export async function webSearch(
   query: string,
   num = 8,
   recency: Recency = 'oneYear',
-  opts: { hackathon?: boolean } = {},
+  opts: { hackathon?: boolean; minEnough?: number } = {},
 ): Promise<SearchHit[]> {
   const q = query.trim();
   if (!q) return [];
@@ -529,7 +554,9 @@ export async function webSearch(
 
   let hits: SearchHit[] = [];
   try {
-    hits = (await mergeSources(jobs, Math.min(4, num))).slice(0, num);
+    // minEnough: сколько разных результатов ждать до досрочного завершения гонки.
+    // Для точечных (кастомных) запросов ждём больше источников — так тематика успевает догрузиться.
+    hits = (await mergeSources(jobs, Math.min(opts.minEnough ?? 4, num))).slice(0, num);
   } catch {
     hits = [];
   }

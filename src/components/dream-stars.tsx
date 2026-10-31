@@ -8,6 +8,39 @@ const STAR_STYLES: Record<string, { dot: string; glow: string }> = Object.fromEn
   DREAM_COLORS.map((c) => [c.id, { dot: c.dot, glow: c.glow }]),
 );
 
+const LS_KEY = 'tts_dreams_v1';
+
+/** Свои мечты храним в localStorage: даже если серверная БД обнулилась,
+ *  твоя звезда всё равно светится именно у тебя. */
+function loadLocal(): DreamStarInfo[] {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter((d) => d && d.id && typeof d.x === 'number') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocal(list: DreamStarInfo[]): void {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(list.slice(0, 10)));
+  } catch {
+    // приватный режим / переполнение — не критично
+  }
+}
+
+function mergeDreams(a: DreamStarInfo[], b: DreamStarInfo[]): DreamStarInfo[] {
+  const seen = new Set<string>();
+  const out: DreamStarInfo[] = [];
+  for (const d of [...a, ...b]) {
+    if (!d || !d.id || seen.has(d.id)) continue;
+    seen.add(d.id);
+    out.push(d);
+  }
+  return out.slice(0, 60);
+}
+
 function formatDate(iso: string): string {
   try {
     return new Date(iso).toLocaleDateString('ru-RU', {
@@ -31,21 +64,29 @@ export function DreamStars() {
 
   useEffect(() => {
     let cancelled = false;
-    // подгрузка мечт с сервера (setState — в колбэке внешнего ответа)
+
+    // 1) Мгновенно показываем свои звёзды из localStorage (без ожидания сервера)
+    const mine = loadLocal();
+    if (mine.length > 0) setDreams(mine);
+
+    // 2) Подмешиваем общее небо с сервера
     fetch('/api/dreams', { cache: 'no-store' })
       .then((r) => r.json())
       .then((json: { dreams?: DreamStarInfo[] }) => {
         if (!cancelled && json && Array.isArray(json.dreams)) {
-          setDreams(json.dreams.filter((d) => d && d.id && typeof d.x === 'number'));
+          const serverDreams = json.dreams.filter((d) => d && d.id && typeof d.x === 'number');
+          setDreams(mergeDreams(serverDreams, mine));
         }
       })
       .catch(() => {
-        // небо без мечт — не критично
+        // небо без мечт — не критично, свои звёзды уже светятся
       });
 
     const onAdded = (e: Event) => {
       const dream = (e as CustomEvent<DreamStarInfo>).detail;
-      if (dream?.id) setDreams((prev) => [dream, ...prev]);
+      if (!dream?.id) return;
+      setDreams((prev) => mergeDreams([dream], prev));
+      if (!dream.id.startsWith('local-')) saveLocal([dream, ...loadLocal().filter((d) => d.id !== dream.id)]);
     };
     window.addEventListener('tts:dream-added', onAdded);
     return () => {

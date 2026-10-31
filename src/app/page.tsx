@@ -3,24 +3,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { useTheme } from 'next-themes';
-import { Compass, MessageSquareText, Star, Sun, Moon, Hourglass } from 'lucide-react';
+import { Compass, MessageSquareText, Star, Sun, Moon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { FeedTab } from '@/components/feed-tab';
 import { ChatTab } from '@/components/chat-tab';
 import { FavoritesTab, type FavoriteItem } from '@/components/favorites-tab';
-import { CapsuleTab } from '@/components/capsule-tab';
 import { Starfield } from '@/components/starfield';
 import { DreamStars } from '@/components/dream-stars';
 import { SkyMoon } from '@/components/moon';
 import { useToast } from '@/hooks/use-toast';
 import type { Category, ChatMessage, DiscoverResponse, Opportunity } from '@/lib/types';
 
-type Tab = 'feed' | 'chat' | 'favorites' | 'capsule';
+type Tab = 'feed' | 'chat' | 'favorites';
 
 const TABS: { id: Tab; label: string; icon: typeof Compass }[] = [
   { id: 'feed', label: 'Лента', icon: Compass },
   { id: 'chat', label: 'Чат', icon: MessageSquareText },
-  { id: 'capsule', label: 'Капсула', icon: Hourglass },
   { id: 'favorites', label: 'Избранное', icon: Star },
 ];
 
@@ -45,10 +43,10 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>('feed');
   const [sessionId, setSessionId] = useState<string>('');
 
-  // Открытие по прямой ссылке с вкладкой: /?tab=capsule (после Google OAuth и из шапки)
+  // Открытие по прямой ссылке с вкладкой: /?tab=favorites (из шапки)
   useEffect(() => {
     const t = new URLSearchParams(window.location.search).get('tab');
-    if (t === 'chat' || t === 'favorites' || t === 'capsule') setTab(t);
+    if (t === 'chat' || t === 'favorites') setTab(t);
   }, []);
 
   // Лента
@@ -325,7 +323,6 @@ export default function Home() {
         {tab === 'favorites' && (
           <FavoritesTab favorites={favorites} loading={loadingFavorites} onRemove={removeFavorite} />
         )}
-        {tab === 'capsule' && <CapsuleTab />}
       </main>
 
       {/* Footer */}

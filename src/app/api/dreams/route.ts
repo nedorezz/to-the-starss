@@ -1,34 +1,68 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { randomUUID } from 'crypto';
 import { db, ensureSchema } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
+
+/*
+ * Звёзды-мечты. ВАЖНО: работаем через сырой SQL ($queryRawUnsafe), а не через
+ * сгенерированный Prisma-клиент (db.dreamStar). Если на хостинге при сборке
+ * использовалась старая prisma/schema.prisma без модели DreamStar, сгенерированный
+ * клиент не умеет db.dreamStar и все запросы падали с 500 — из-за этого звёзды
+ * «не работали». Сырой SQL не зависит от схемы и чинит это раз и навсегда.
+ */
 
 const ALLOWED_COLORS = ['green', 'yellow', 'red'];
 const MAX_PER_PERSON = 3;
 const MAX_TOTAL = 300;
 
+interface DreamRow {
+  id: string;
+  text: string;
+  color: string;
+  x: number;
+  y: number;
+  createdAt: string | Date;
+}
+
+function toDream(r: DreamRow) {
+  let createdAt = '';
+  try {
+    const d = r.createdAt instanceof Date ? r.createdAt : new Date(String(r.createdAt).replace(' ', 'T'));
+    createdAt = d.toISOString();
+  } catch {
+    createdAt = new Date().toISOString();
+  }
+  return {
+    id: String(r.id),
+    text: String(r.text),
+    color: String(r.color),
+    x: Number(r.x),
+    y: Number(r.y),
+    createdAt,
+  };
+}
+
+async function countStars(where?: string, ...params: unknown[]): Promise<number> {
+  const sql = where
+    ? `SELECT COUNT(*) AS c FROM "DreamStar" WHERE ${where}`
+    : 'SELECT COUNT(*) AS c FROM "DreamStar"';
+  const rows = (await db.$queryRawUnsafe<{ c: number | bigint }[]>(sql, ...params)) as {
+    c: number | bigint;
+  }[];
+  return Number(rows?.[0]?.c ?? 0);
+}
+
 /** GET — все звёзды-мечты (публичное небо сайта). */
 export async function GET() {
   try {
     await ensureSchema();
-    const total = await db.dreamStar.count();
-    // держим небо лёгким: если мечт стало очень много — показываем последние
-    const rows = await db.dreamStar.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: Math.min(200, MAX_TOTAL),
-    });
-    return NextResponse.json({
-      dreams: rows.map((d) => ({
-        id: d.id,
-        text: d.text,
-        color: d.color,
-        x: d.x,
-        y: d.y,
-        createdAt: d.createdAt.toISOString(),
-      })),
-    });
+    const rows = (await db.$queryRawUnsafe<DreamRow[]>(
+      `SELECT "id", "text", "color", "x", "y", "createdAt" FROM "DreamStar" ORDER BY "createdAt" DESC LIMIT 200`,
+    )) as DreamRow[];
+    return NextResponse.json({ dreams: (rows || []).map(toDream) });
   } catch (error) {
-    console.error('[dreams GET] error:', error);
+    console.error('[dreams GET] error:', (error as Error)?.message);
     return NextResponse.json({ dreams: [] });
   }
 }
@@ -56,7 +90,7 @@ export async function POST(req: NextRequest) {
 
     await ensureSchema();
 
-    const mine = await db.dreamStar.count({ where: { sessionId } });
+    const mine = await countStars('"sessionId" = ?', sessionId);
     if (mine >= MAX_PER_PERSON) {
       return NextResponse.json(
         { error: `Максимум ${MAX_PER_PERSON} звезды с одного браузера — место в небе дороже` },
@@ -65,28 +99,37 @@ export async function POST(req: NextRequest) {
     }
 
     // позиция: избегаем самой верхушки (хедер) и самых низов
-    const star = await db.dreamStar.create({
-      data: {
-        sessionId,
-        text,
-        color,
-        x: Math.round((3 + Math.random() * 92) * 10) / 10,
-        y: Math.round((9 + Math.random() * 62) * 10) / 10,
-      },
-    });
+    const id = randomUUID();
+    const x = Math.round((3 + Math.random() * 92) * 10) / 10;
+    const y = Math.round((9 + Math.random() * 62) * 10) / 10;
+    const createdAt = new Date().toISOString();
 
-    return NextResponse.json({
-      dream: {
-        id: star.id,
-        text: star.text,
-        color: star.color,
-        x: star.x,
-        y: star.y,
-        createdAt: star.createdAt.toISOString(),
-      },
-    });
+    await db.$executeRawUnsafe(
+      `INSERT INTO "DreamStar" ("id", "sessionId", "text", "color", "x", "y", "createdAt")
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      sessionId,
+      text,
+      color,
+      x,
+      y,
+      createdAt,
+    );
+
+    // держим небо лёгким: если мечт стало совсем много — подчищаем самые старые
+    const total = await countStars();
+    if (total > MAX_TOTAL) {
+      await db.$executeRawUnsafe(
+        `DELETE FROM "DreamStar" WHERE "id" NOT IN (
+           SELECT "id" FROM "DreamStar" ORDER BY "createdAt" DESC LIMIT ?
+         )`,
+        MAX_TOTAL,
+      );
+    }
+
+    return NextResponse.json({ dream: { id, text, color, x, y, createdAt } });
   } catch (error) {
-    console.error('[dreams POST] error:', error);
+    console.error('[dreams POST] error:', (error as Error)?.message);
     return NextResponse.json({ error: 'Не удалось зажечь звезду' }, { status: 500 });
   }
 }
@@ -100,13 +143,17 @@ export async function DELETE(req: NextRequest) {
       return NextResponse.json({ error: 'Не указана звезда' }, { status: 400 });
     }
     await ensureSchema();
-    const deleted = await db.dreamStar.deleteMany({ where: { id, sessionId } });
-    if (deleted.count === 0) {
+    const deleted = await db.$executeRawUnsafe(
+      `DELETE FROM "DreamStar" WHERE "id" = ? AND "sessionId" = ?`,
+      id,
+      sessionId,
+    );
+    if (!deleted) {
       return NextResponse.json({ error: 'Звезда не найдена' }, { status: 404 });
     }
     return NextResponse.json({ ok: true });
   } catch (error) {
-    console.error('[dreams DELETE] error:', error);
+    console.error('[dreams DELETE] error:', (error as Error)?.message);
     return NextResponse.json({ error: 'Не удалось удалить звезду' }, { status: 500 });
   }
 }
