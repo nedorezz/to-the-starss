@@ -20,6 +20,17 @@ export interface SearchHit {
   snippet?: string;
   host_name?: string;
   date?: string;
+  /** Структурные поля (пока только Devpost) — чтобы строить карточки без ИИ. */
+  meta?: DevpostMeta;
+}
+
+export interface DevpostMeta {
+  location?: string;
+  dates?: string;
+  prize?: string;
+  themes?: string;
+  members?: string;
+  org?: string;
 }
 
 export type Recency = 'oneDay' | 'oneWeek' | 'oneMonth' | 'oneYear' | 'noLimit';
@@ -297,7 +308,7 @@ interface DevpostItem {
 }
 
 /** Devpost — публичный API актуальных хакатонов (бесплатно, без ключа). */
-async function devpostSearch(num: number): Promise<SearchHit[]> {
+export async function devpostSearch(num: number): Promise<SearchHit[]> {
   const res = await fetch(`https://devpost.com/api/hackathons?status=upcoming&limit=${Math.max(10, num)}`, {
     headers: { 'User-Agent': UA, Accept: 'application/json' },
     cache: 'no-store',
@@ -308,20 +319,29 @@ async function devpostSearch(num: number): Promise<SearchHit[]> {
   const out: SearchHit[] = [];
   for (const h of data.hackathons || []) {
     if (!h.title || !h.url) continue;
-    const bits: string[] = [];
-    if (h.displayed_location?.location) bits.push(h.displayed_location.location);
-    if (h.submission_period_dates) bits.push(`Даты: ${h.submission_period_dates}`);
     const prize = h.prize_amount ? stripTags(h.prize_amount) : '';
-    if (prize) bits.push(`Призовой фонд: ${prize}`);
     const themes = (h.themes || []).map((t) => t.name).filter(Boolean).slice(0, 3);
+    const meta: DevpostMeta = {
+      location: h.displayed_location?.location || '',
+      dates: h.submission_period_dates || '',
+      prize,
+      themes: themes.join(', '),
+      members: h.registrations_count ? String(h.registrations_count) : '',
+      org: h.organization_name || '',
+    };
+    const bits: string[] = [];
+    if (meta.location) bits.push(meta.location);
+    if (meta.dates) bits.push(`Даты: ${meta.dates}`);
+    if (prize) bits.push(`Призовой фонд: ${prize}`);
     if (themes.length) bits.push(`Темы: ${themes.join(', ')}`);
-    if (h.registrations_count) bits.push(`Участников: ${h.registrations_count}`);
+    if (meta.members) bits.push(`Участников: ${meta.members}`);
     out.push({
       url: h.url,
       name: h.title,
       snippet: bits.join(' | '),
       host_name: 'devpost.com',
-      date: h.submission_period_dates || '',
+      date: meta.dates,
+      meta,
     });
     if (out.length >= num) break;
   }

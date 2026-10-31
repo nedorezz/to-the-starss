@@ -22,3 +22,27 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
 }
+
+export interface AuthUser {
+  email: string;
+  name?: string | null;
+  provider?: string;
+}
+
+export interface CapsuleInfo {
+  id: string;
+  title: string | null;
+  deliverAt: string;
+  createdAt: string;
+  locked: boolean;
+  message?: string;
+}
+
+export interface DreamStarInfo {
+  id: string;
+  text: string;
+  color: string;
+  x: number;
+  y: number;
+  createdAt: string;
+}

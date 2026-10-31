@@ -275,6 +275,19 @@
     transform: scale(1.08);
   }
 }
+
+/* Звёзды-мечты: мерцание цветной звезды */
+@keyframes tts-twinkle {
+  0%,
+  100% {
+    opacity: 0.7;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.35);
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .moon-glow {
     animation: none;

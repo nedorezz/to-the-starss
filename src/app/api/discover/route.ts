@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { domainToUnicode } from 'url';
 import ZAI from 'z-ai-web-dev-sdk';
 import { ensureAiConfig, resolveAiModel } from '@/lib/ai-config';
-import { webSearch, looksLikeHackathonQuery, type SearchHit, type Recency } from '@/lib/web-search';
+import { webSearch, looksLikeHackathonQuery, devpostSearch, type SearchHit, type Recency } from '@/lib/web-search';
 import type { Opportunity, Category } from '@/lib/types';
 
 export const maxDuration = 60;
@@ -115,6 +115,31 @@ function extractJson(text: string): { summary: string; items: Opportunity[] } | 
   }
 }
 
+function devpostToOpportunity(h: SearchHit): Opportunity {
+  const m = h.meta || {};
+  const bits: string[] = [];
+  if (m.dates) bits.push(`Проведение: ${m.dates}`);
+  if (m.prize) bits.push(`призовой фонд ${m.prize}`);
+  if (m.themes) bits.push(`направления: ${m.themes}`);
+  if (m.members) bits.push(`уже участвуют: ${m.members}`);
+  const where = m.location && m.location.toLowerCase() !== 'online' ? ` (${m.location})` : '';
+  const desc =
+    bits.length > 0
+      ? `Регистрация открыта${where}. ${bits.join(', ')}.`
+      : 'Регистрация открыта — детали, требования и состав команды на странице хакатона.';
+  return {
+    title: h.name || 'Хакатон на Devpost',
+    description: desc,
+    url: h.url || 'https://devpost.com/hackathons',
+    source: 'devpost.com',
+    deadline: m.dates || 'Уточнить на сайте',
+    prize: m.prize || '',
+    format: where ? 'оффлайн+город' : 'онлайн',
+    level: 'для всех',
+    category: 'hackathon',
+  };
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -126,6 +151,29 @@ export async function POST(req: NextRequest) {
     const cachedResp = respCache.get(respKey);
     if (cachedResp && Date.now() - cachedResp.at < RESP_TTL) {
       return NextResponse.json(cachedResp.payload as Record<string, unknown>);
+    }
+
+    // Быстрый путь для категории «Хакатоны»: Devpost сам отдаёт готовую структуру
+    // (даты, призовой фонд, темы), ИИ не нужен — ответ за 1-3 секунды и без
+    // зависимости от api.z.ai (который иногда отдаёт 502 или думает 15-25 секунд).
+    if (!customQuery && category === 'hackathon') {
+      try {
+        const devHits = await devpostSearch(6);
+        if (devHits.length >= 3) {
+          const fastItems = devHits.slice(0, 6).map(devpostToOpportunity);
+          const fastPayload = {
+            items: fastItems,
+            summary: `Нашёл ${fastItems.length} актуальных хакатонов с открытой регистрацией на Devpost — даты, направления и призовой фонд на карточках. Успей подать заявку!`,
+            updatedAt: new Date().toISOString(),
+          };
+          if (respCache.size > 100) respCache.clear();
+          respCache.set(respKey, { at: Date.now(), payload: fastPayload });
+          return NextResponse.json(fastPayload);
+        }
+      } catch (e) {
+        console.error('[discover] devpost fast path failed:', (e as Error).message);
+        // молча падаем в обычный путь ниже
+      }
     }
 
     if (!ensureAiConfig()) {
@@ -178,6 +226,21 @@ export async function POST(req: NextRequest) {
         if (!url || !hit.name || seen.has(url)) continue;
         seen.add(url);
         hits.push(hit);
+      }
+    }
+
+    // Для хакатон-запросов подмешиваем структурные данные Devpost — ИИ получает качественный материал
+    if (category === 'hackathon' || looksLikeHackathonQuery(customQuery || '')) {
+      try {
+        const devHits = await devpostSearch(4);
+        for (const h of devHits) {
+          const url = h.url || '';
+          if (!url || !h.name || seen.has(url)) continue;
+          seen.add(url);
+          hits.push(h);
+        }
+      } catch {
+        // не критично — работают остальные источники
       }
     }
 

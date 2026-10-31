@@ -10,6 +10,8 @@
 
 - **Лента** — ИИ ищет хакатоны, розыгрыши и способы роста портфолио; всё раскладывается по категориям с цветными стикерами
 - **Чат** — спроси своими словами, ИИ подберёт варианты под тебя
+- **Капсула времени** — запечатай записку себе из будущего и выбери дату: до неё текст спрятан даже от сервера. Нужен аккаунт (Google или e-mail)
+- **Звёзды-мечты** — напиши мечту, выбери цвет (зелёный/жёлтый/красный) — и она загорится цветной звездой на небе сайта; наведи курсор — увидишь текст
 - **Избранное** — сохраняй интересные события в один клик (иконка ★)
 - **Тёмная / светлая тема** — переключатель в шапке
 - **Живой фон** — мерцающие звёзды, падающие звёзды и анимированная луна
@@ -18,8 +20,52 @@
 
 Next.js 16 (App Router) · TypeScript · Tailwind CSS 4 · shadcn/ui · Framer Motion · Prisma + SQLite · z-ai-web-dev-sdk
 
+## Запуск локально
 
-https://to-the-starss.vercel.app/
+```bash
+bun install        # или npm install
+bun run db:push    # создать SQLite-базу
+bun run dev        # http://localhost:3000
+```
 
+> Без настроенного ИИ-ключа сайт откроется и будет работать — ИИ-лента и чат вежливо напишут, что ключ не подключён.
+
+## Деплой в интернет (GitHub + Vercel)
+
+1. Загрузи файлы проекта в репозиторий GitHub
+2. На vercel.com: «Add New…» → Project → Import репозитория → Deploy
+3. Готово: адрес вида `to-the-stars.vercel.app`
+
+## Переменные окружения
+
+| Переменная | Обязательна | Зачем |
+|---|---|---|
+| `DATABASE_URL` | да (уже в `.env.production`) | SQLite-база избранного (`file:/tmp/tts.db`) |
+| `ZAI_CONFIG_JSON` | для ИИ | Доступ к ИИ: `{"baseUrl":"https://api.z.ai/api/paas/v4","apiKey":"ТВОЙ_КЛЮЧ"}` |
+| `AI_MODEL` | нет | Своя модель. На Vercel по умолчанию — `glm-4.5-flash` (бесплатная); можно не задавать |
+| `SEARCH_PAID_FALLBACK` | нет | Веб-поиск бесплатный (DuckDuckGo). Если с Vercel его вдруг заблокируют — поставь `1`, включится платный запасной поиск z.ai |
+| `AUTH_SECRET` | нет | Секрет для подписи сессий входа (капсула времени). Любая длинная случайная строка; без неё работает запасной дефолт |
+| `GOOGLE_CLIENT_ID` | нет | Вход через Google для капсулы времени — см. инструкцию ниже |
+| `GOOGLE_CLIENT_SECRET` | нет | Вторая половина ключа Google OAuth |
+| `NEXT_PUBLIC_SITE_URL` | нет | Адрес сайта вида `https://to-the-starss.vercel.app` — помогает Google OAuth не путаться с адресом |
+
+**Как включить ИИ на Vercel:** Settings → Environment Variables → добавь `ZAI_CONFIG_JSON` → Redeploy. Поиск и чат оживут.
+
+**Избранное и капсулы** на бесплатном Vercel живут до перезапуска сервера (SQLite в /tmp). Для постоянного хранения можно подключить бесплатную базу Turso или Neon.
+
+## Вход через Google (для капсулы времени)
+
+Без настройки тоже всё работает — регистрация по e-mail и паролю доступна сразу. Хочешь кнопку «Войти через Google»? Бесплатно, минут 10:
+
+1. Открой [console.cloud.google.com](https://console.cloud.google.com/) → создай проект (любое имя, например «To the stars»)
+2. «APIs & Services» → «OAuth consent screen» → External → заполни только имя приложения и e-mail → Save
+3. «APIs & Services» → «Credentials» → «Create Credentials» → «OAuth client ID» → тип «Web application»
+4. В «Authorized redirect URIs» добавь: `https://ТВОЙ-АДРЕС.vercel.app/api/auth/google/callback`
+5. Скопируй Client ID и Client secret → на Vercel добавь переменные `GOOGLE_CLIENT_ID` и `GOOGLE_CLIENT_SECRET` → Redeploy
+6. Готово: на вкладке «Капсула» появится рабочая кнопка «Войти через Google»
+
+> При тестировании на localhost Google может ругаться — добавь туда и `http://localhost:3000/api/auth/google/callback` в redirect URIs.
+
+---
 
 © 2026 To the stars · сделал dorezz ✦
